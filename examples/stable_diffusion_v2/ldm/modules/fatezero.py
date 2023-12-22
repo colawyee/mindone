@@ -246,6 +246,8 @@ class CrossAttention(nn.Cell):
         else:
             out, attn = self.attention(q, k, v, mask, is_cross_attention=is_cross, step=step, controller=controller)
         if is_cross_replace:
+            shape = attn.shape
+            attn[:shape[0]//2] = cross_attn
             print('replace cross attn')
 
         def rearange_out(x):
@@ -323,6 +325,8 @@ class SparseCausalAttention(CrossAttention):
         else:
             out, attn = self.attention(q, k, v, mask, is_cross_attention=is_cross, step=step, controller=controller, )
         if is_self_replace:
+            shape = attn.shape
+            attn[:shape[0]//2] = self_attn
             print('replace self attn')
 
         def rearange_out(x):
