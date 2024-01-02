@@ -119,7 +119,8 @@ class DDIMSampler(BaseDDIMSampler):
         if noise_dropout > 0.0:
             noise, _ = ms.ops.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-
+        if self.edit_controller:
+            x_prev = self.edit_controller.step_callback(x_prev)
         return x_prev, pred_x0
 
     def encode(

@@ -417,7 +417,8 @@ def main(args):
         tokenized_prompts = model.tokenize(prompts)
         c = model.get_learned_conditioning(tokenized_prompts)
 
-        local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep', ], ["car", ]])
+        # local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep', ], ["car", ]])
+        local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep']])
         controller = AttentionControlReplace(prompts=[source_prompt, target_prompt], local_blend=local_blend)
         inv_sampler.pre_sample(model=model, controller=controller)
         samples_ddim, _ = inv_sampler.sample(

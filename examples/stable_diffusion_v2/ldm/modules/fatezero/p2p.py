@@ -215,20 +215,33 @@ class AttentionStore():
 
 class AttentionControlReplace():
     def step_callback(self, x_t):
-        if self.latent_blend is not None and (50 - 1 - self.cur_step) >= len(self.attention_store_all_step):
-            store = self.attention_store_all_step[50 - 1 - self.cur_step]
-            x_t = self.latent_blend(attention_store=store, x_t=x_t)
+        if self.local_blend is not None and (50 - 1 - self.cur_step) >= len(self.attention_store_all_step):
+            # store = self.attention_store_all_step[50 - 1 - self.cur_step]
+            # x_t = self.latent_blend(attention_store=store, x_t=x_t)
+            pass
 
         self.cur_att_layer = 0
         self.cur_step += 1
         return x_t
 
     def replace_self_attention(self, attn_base, attn_replace, mask=None):
-        if attn_replace.shape[2] <= 16 ** 2:
-            attn_base = attn_base.unsqueeze(0).broadcast_to((attn_replace.shape[0],) + attn_base.shape)
+        # if attn_replace.shape[2] <= 16 ** 2:
+        if attn_replace.shape[2] <= 32 ** 2:
+            # attn_base = attn_base.unsqueeze(0).broadcast_to((attn_replace.shape[0],) + attn_base.shape)
             if mask is not None:
-                return attn_base * (1 - mask) + mask * attn_replace
-            return attn_base
+                ch, rr, d = attn_base.shape
+                h = 5
+                c = ch // h
+                base = ms.ops.reshape(attn_base, (c, h, rr, d))[None, ...]
+                replace = ms.ops.reshape(attn_replace[:ch], (c, h, rr, d))[None, ...]
+                print("attn_base.shape", attn_base.shape)
+                print("attn_replace.shape", attn_replace.shape)
+                print("mask.shape", mask.shape)
+                r = (1 - mask) * base + mask * replace
+                r = ms.ops.reshape(r.squeeze(0), (ch, rr, d))
+            else:
+                r = attn_base
+            return ms.ops.cat((r, attn_replace[r.shape[0]:]), axis=0)
         else:
             return attn_replace
 
@@ -241,11 +254,14 @@ class AttentionControlReplace():
         j = self.mapper.to(ms.float16).permute(0, 2, 1)
         r = ms.ops.matmul(i, j).to(dtype)
         r = r.reshape((p, h, b, n)).permute(2, 1, 0, 3)
-        return r
+        r = r.squeeze(0)
+        return ms.ops.cat((r, att_replace[h:]), axis=0)
         # return ms.ops.einsum('hpw,bwn->bhpn', attn_base, self.mapper)
 
     def forward(self, attn, is_cross: bool, place_in_unet: int):
         if 50 - 1 - self.cur_step >= len(self.attention_store_all_step):
+            return attn
+        if attn.shape[1] > 1024:
             return attn
         store = self.attention_store_all_step[50 - 1 - self.cur_step]
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
@@ -254,8 +270,14 @@ class AttentionControlReplace():
         if is_cross:
             attn = self.replace_cross_attention(attn_base, attn)
         else:
-            w = int(np.sqrt(attn.shape[1]))
-            mask = self.local_blend(target_h=w, target_w=w, attention_store=store)
+            if attn.shape[1] <= 1024:
+                w = int(np.sqrt(attn.shape[1]))
+                mask = self.local_blend(target_h=w, target_w=w, attention_store=store, step_in_store=self.cur_step)
+                (d, c, h, w) = mask.shape
+                mask = ms.ops.reshape(mask, (d, c, h * w))
+                mask = ms.ops.transpose(mask, (1, 0, 2))[..., None]
+            else:
+                mask = None
             attn = self.replace_self_attention(attn_base, attn, mask)
         return attn
 
