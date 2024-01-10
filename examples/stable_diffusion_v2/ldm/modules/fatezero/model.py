@@ -42,7 +42,11 @@ def normalization(channels, eps: float = 1e-5):
 
 
 class CrossAttention(BaseCrossAttention):
-    def _attention(self, k, q, v, mask):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cur_step = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
+
+    def _attention(self, k, q, v, mask=None, is_cross=False):
 
         def rearange_in(x):
             # (b, n, h*d) -> (b*h, n, d)
@@ -62,7 +66,13 @@ class CrossAttention(BaseCrossAttention):
         if self.use_flash_attention and q.shape[1] % 16 == 0 and k.shape[1] % 16 == 0:
             out = self.flash_attention(q, k, v)
         else:
+            print('attention:', q.shape, k.shape)
+
+            print(self.cur_step.asnumpy(), self.layer_name, self.layer_num)
+            key = F"attn-step_{self.cur_step}_{self.layer_name}-{'cross' if is_cross else 'self'}_{self.layer_num}"
+            print(key)
             out = self.attention(q, k, v, mask)
+            # ms.save_checkpoint([{"name": "data", "data": out}], F"./output/{key}.ckpt")
 
         def rearange_out(x):
             # (b*h, n, d) -> (b, n, h*d)
@@ -78,13 +88,16 @@ class CrossAttention(BaseCrossAttention):
         out = rearange_out(out)
         return self.to_out(out)
 
-    def construct(self, x, context=None, mask=None):
-
+    def construct(self, x, context=None, mask=None, cur_step=0):
+        if context is not None:
+            is_cross = True
+        else:
+            is_cross = False
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
-        return self._attention(k, q, v, mask)
+        return self._attention(k, q, v, mask, is_cross=is_cross)
 
 
 # Spatial Transformer and Attention Layer Modification based on SD
@@ -105,6 +118,10 @@ class SparseCausalAttention(CrossAttention):
         return x
 
     def construct(self, x, context=None, mask=None, video_length=None):
+        if context is not None:
+            is_cross = True
+        else:
+            is_cross = False
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
@@ -115,7 +132,7 @@ class SparseCausalAttention(CrossAttention):
 
         k = self.concat_first_previous_features(k, video_length, former_frame_index)
         v = self.concat_first_previous_features(v, video_length, former_frame_index)
-        return self._attention(k, q, v, mask)
+        return self._attention(k, q, v, mask, is_cross=is_cross)
 
 
 class BasicTransformerBlock_ST(nn.Cell):
@@ -132,6 +149,8 @@ class BasicTransformerBlock_ST(nn.Cell):
             enable_flash_attention=False,
             cross_frame_attention=False,
             unet_chunk_size=2,
+            layer_name='in',
+            layer_num=0,
     ):
         super().__init__()
         assert not cross_frame_attention, "expect to have cross_frame_attention to be False"
@@ -144,7 +163,8 @@ class BasicTransformerBlock_ST(nn.Cell):
             dtype=dtype,
             enable_flash_attention=enable_flash_attention,
         )  # is a self-attention
-        self.attn1.attention_type = 'SparseCausalAttention'
+        self.attn1.layer_name = layer_name
+        self.attn1.layer_num = layer_num
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff, dtype=dtype)
 
         self.attn2 = CrossAttention(
@@ -157,7 +177,8 @@ class BasicTransformerBlock_ST(nn.Cell):
             enable_flash_attention=enable_flash_attention,
 
         )  # is self-attn if context is none
-        self.attn2.attention_type = 'CrossAttention'
+        self.attn2.layer_name = layer_name
+        self.attn2.layer_num = layer_num
 
         self.norm1 = nn.LayerNorm([dim], epsilon=1e-05).to_float(dtype)
         self.norm2 = nn.LayerNorm([dim], epsilon=1e-05).to_float(dtype)
@@ -165,7 +186,7 @@ class BasicTransformerBlock_ST(nn.Cell):
         self.checkpoint = checkpoint
 
         # Temp-Attn
-        self.attn_temp = CrossAttention(
+        self.attn_temp = BaseCrossAttention(
             query_dim=dim,
             heads=n_heads,
             dim_head=d_head,
@@ -176,8 +197,11 @@ class BasicTransformerBlock_ST(nn.Cell):
         )
         self.attn_temp.to_out[0].weight = Parameter(ms.Tensor(np.zeros(self.attn_temp.to_out[0].weight.shape), dtype))
         self.norm_temp = nn.LayerNorm([dim], epsilon=1e-05).to_float(dtype)
+        self.cur_step = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
 
     def construct(self, x, context=None, video_length=None):
+        self.attn1.cur_step = self.cur_step
+        self.attn2.cur_step = self.cur_step
         x = self.attn1(self.norm1(x), video_length=video_length) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
@@ -213,6 +237,8 @@ class SpatialTransformer3D(nn.Cell):
             enable_flash_attention=False,
             cross_frame_attention=False,
             unet_chunk_size=2,
+            layer_name='in',
+            layer_num=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -242,6 +268,8 @@ class SpatialTransformer3D(nn.Cell):
                     enable_flash_attention=enable_flash_attention,
                     cross_frame_attention=cross_frame_attention,
                     unet_chunk_size=unet_chunk_size,
+                    layer_name=layer_name,
+                    layer_num=layer_num,
                 )
                 for d in range(depth)
             ]
@@ -257,6 +285,7 @@ class SpatialTransformer3D(nn.Cell):
         self.use_linear = use_linear
         self.reshape = ops.Reshape()
         self.transpose = ops.Transpose()
+        self.cur_step = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
 
     def construct(self, x, emb=None, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
@@ -281,6 +310,7 @@ class SpatialTransformer3D(nn.Cell):
             )  # (b*f, ch, h, w) -> (b*f, h, w, ch) -> (b*f, h*w, ch)
             x = self.proj_in(x)
         for block in self.transformer_blocks:
+            ms.ops.assign(block.cur_step, self.cur_step)
             x = block(x, context=context, video_length=f)
         if self.use_linear:
             x = self.proj_out(x)
@@ -738,7 +768,7 @@ class UNetModel3D(nn.Cell):
         input_block_chans = [model_channels]
         ch = model_channels
         ds = 1
-
+        layer_num = 0
         for level, mult in enumerate(channel_mult):
             for _ in range(num_res_blocks):
                 layers = nn.CellList(
@@ -784,8 +814,11 @@ class UNetModel3D(nn.Cell):
                             dropout=self.dropout,
                             use_linear=use_linear_in_transformer,
                             enable_flash_attention=enable_flash_attention,
+                            layer_name='in',
+                            layer_num=layer_num,
                         )
                     )
+                    layer_num += 1
                 self.input_blocks.append(layers)
                 self._feature_size += ch
                 input_block_chans.append(ch)
@@ -860,6 +893,8 @@ class UNetModel3D(nn.Cell):
                     dropout=self.dropout,
                     use_linear=use_linear_in_transformer,
                     enable_flash_attention=enable_flash_attention,
+                    layer_name='mid',
+                    layer_num=0,
                 ),
                 ResnetBlock3D(
                     ch,
@@ -875,6 +910,8 @@ class UNetModel3D(nn.Cell):
         self._feature_size += ch
 
         self.output_blocks = nn.CellList([])
+        layer_num = 0
+
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
                 ich = input_block_chans.pop()
@@ -922,8 +959,11 @@ class UNetModel3D(nn.Cell):
                             dropout=self.dropout,
                             use_linear=use_linear_in_transformer,
                             enable_flash_attention=enable_flash_attention,
+                            layer_name='out',
+                            layer_num=layer_num,
                         )
                     )
+                    layer_num += 1
                 if level and i == num_res_blocks:
                     out_ch = ch
                     layers.append(
@@ -969,6 +1009,14 @@ class UNetModel3D(nn.Cell):
         self.cur_step = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
         self.is_invert = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
 
+    @staticmethod
+    def is_attention_layer(c):
+        name = c.__class__.__name__
+        if name in ['SpatialTransformer3D']:
+            return True
+
+        return False
+
     def construct(
             self, x, timesteps=None, context=None, y=None, features_adapter: list = None, append_to_context=None,
             **kwargs
@@ -981,11 +1029,6 @@ class UNetModel3D(nn.Cell):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        if is_true(self.is_invert):
-            print(True)
-        else:
-            print(False)
-        print(self.cur_step.value)
         assert (y is not None) == (
                 self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -1005,6 +1048,8 @@ class UNetModel3D(nn.Cell):
         adapter_idx = 0
         for i, celllist in enumerate(self.input_blocks, 1):
             for cell in celllist:
+                if self.is_attention_layer(cell):
+                    ms.ops.assign(cell.cur_step, self.cur_step)
                 h = cell(h, emb, context)
             if features_adapter and i % 3 == 0:
                 h = h + features_adapter[adapter_idx]
@@ -1016,19 +1061,23 @@ class UNetModel3D(nn.Cell):
             assert len(features_adapter) == adapter_idx, "Wrong features_adapter"
 
         for module in self.middle_block:
+            if self.is_attention_layer(module):
+                ms.ops.assign(module.cur_step, self.cur_step)
             h = module(h, emb, context)
 
         hs_index = -1
         for celllist in self.output_blocks:
             h = self.cat((h, hs[hs_index]))
             for cell in celllist:
+                if self.is_attention_layer(cell):
+                    ms.ops.assign(cell.cur_step, self.cur_step)
                 h = cell(h, emb, context)
             hs_index -= 1
 
         if self.cur_step == 49:
-            self.cur_step = 0
+            ms.ops.assign(self.cur_step, ms.Tensor(0, dtype=ms.uint8))
         else:
-            self.cur_step += 1
+            ms.ops.assign(self.cur_step, self.cur_step + 1)
 
         if self.predict_codebook_ids:
             return self.id_predictor(h)
