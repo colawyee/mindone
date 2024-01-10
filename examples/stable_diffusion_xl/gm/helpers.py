@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime
 from typing import List, Union
@@ -17,6 +18,7 @@ from gm.modules.diffusionmodules.sampler import (
     EulerAncestralSampler,
     EulerEDMSampler,
     HeunEDMSampler,
+    LCMSampler,
     LinearMultistepSampler,
 )
 from gm.util import auto_mixed_precision, get_obj_from_str, instantiate_from_config, seed_everything
@@ -27,7 +29,20 @@ import mindspore as ms
 from mindspore import Tensor, context, nn, ops
 from mindspore.communication.management import get_group_size, get_rank, init
 
+_logger = logging.getLogger(__name__)
+
+
+class BroadCast(nn.Cell):
+    def __init__(self, root_rank):
+        super().__init__()
+        self.broadcast = ops.Broadcast(root_rank)
+
+    def construct(self, x):
+        return (self.broadcast((x,)))[0]
+
+
 SD_XL_BASE_RATIOS = {
+    # W/H ratio: (W, H)
     "0.5": (704, 1408),
     "0.52": (704, 1344),
     "0.57": (768, 1344),
@@ -86,6 +101,10 @@ def set_default(args):
         context.set_context(device_id=device_id)
     elif args.device_target == "GPU" and args.ms_enable_graph_kernel:
         context.set_context(enable_graph_kernel=True)
+    if args.max_device_memory is not None:
+        context.set_context(max_device_memory=args.max_device_memory)
+        context.set_context(memory_optimize_level="O1", ascend_config={"atomic_clean_policy": 1})
+
     # Set Parallel
     if args.is_parallel:
         init()
@@ -94,14 +113,25 @@ def set_default(args):
     else:
         args.rank, args.rank_size = 0, 1
 
+    # data sink step
+    if args.data_sink:
+        assert args.dataset_load_tokenizer
+        args.log_interval = args.sink_size
+        if not (args.save_ckpt_interval >= args.sink_size and args.save_ckpt_interval % args.sink_size == 0):
+            args.save_ckpt_interval = args.sink_size * max(1, (args.save_ckpt_interval // args.sink_size))
+        if not (args.infer_interval >= args.sink_size and args.infer_interval % args.sink_size == 0):
+            args.infer_interval = args.sink_size * max(1, (args.infer_interval // args.sink_size))
+
     # split weights path
     args.weight = args.weight.split(",") if len(args.weight) > 0 else ""
 
     # Directories and Save run settings
-    time = _get_broadcast_datetime(rank_size=args.rank_size)
-    args.save_path = os.path.join(
-        args.save_path, f"{time[0]:04d}.{time[1]:02d}.{time[2]:02d}-{time[3]:02d}.{time[4]:02d}.{time[5]:02d}"
-    )
+    if args.save_path_with_time:
+        # FIXME: Bug when running with rank_table on MindSpore 2.2.1; This is not a problem when running with OpenMPI
+        time = _get_broadcast_datetime(rank_size=args.rank_size)
+        args.save_path = os.path.join(
+            args.save_path, f"{time[0]:04d}.{time[1]:02d}.{time[2]:02d}-{time[3]:02d}.{time[4]:02d}.{time[5]:02d}"
+        )
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(os.path.join(args.save_path, "weights"), exist_ok=True)
     if args.rank % args.rank_size == 0:
@@ -132,6 +162,9 @@ def create_model(
     load_filter: bool = False,
     param_fp16: bool = False,
     amp_level: Literal["O0", "O1", "O2", "O3"] = "O0",
+    textual_inversion_ckpt: str = None,
+    placeholder_token: str = None,
+    num_vectors: int = None,
 ):
     # create model
     model = load_model_from_config(config.model, checkpoints, amp_level=amp_level)
@@ -143,16 +176,37 @@ def create_model(
             p.requires_grad = False
 
     if param_fp16:
-        for _, p in model.parameters_and_names():
-            # filter embedding table/position id param
-            if "embedding" not in p.name:
-                p.set_dtype(ms.float16)
-            else:
-                print(f"param {p.name} keep {p.dtype}")
+        convert_modules = (model.conditioner, model.first_stage_model)
+        if isinstance(model.model, nn.Cell):
+            convert_modules += (model.model,)
+        else:
+            assert hasattr(model, "stage1") and isinstance(model.stage1, nn.Cell)
+            convert_modules += (model.stage1, model.stage2)
+
+        for module in convert_modules:
+            k_num, c_num = 0, 0
+            for _, p in module.parameters_and_names():
+                # filter norm/embedding position_ids param
+                if ("position_ids" in p.name) or ("norm" in p.name):
+                    # print(f"param {p.name} keep {p.dtype}") # disable print
+                    k_num += 1
+                else:
+                    c_num += 1
+                    p.set_dtype(ms.float16)
+
+            print(f"Convert `{type(module).__name__}` param to fp16, keep/modify num {k_num}/{c_num}.")
 
     if load_filter:
         # TODO: Add DeepFloydDataFiltering
         raise NotImplementedError
+
+    if textual_inversion_ckpt is not None:
+        assert os.path.exists(textual_inversion_ckpt), f"{textual_inversion_ckpt} does not exist!"
+        from gm.modules.textual_inversion.manager import TextualInversionManager
+
+        manager = TextualInversionManager(model, placeholder_token, num_vectors)
+        manager.load_checkpoint_textual_inversion(textual_inversion_ckpt, verbose=True)
+        return (model, manager), None
 
     return model, None
 
@@ -203,7 +257,7 @@ def get_optimizer(optim_comfig, lr, params, filtering=True):
     optimizer_config = optim_comfig.get("optimizer_config", {"target": "mindspore.nn.SGD"})
 
     def decay_filter(x):
-        return "layernorm" not in x.name.lower() and "bias" not in x.name.lower()
+        return "norm" not in x.name.lower() and "bias" not in x.name.lower()
 
     # filtering weight
     if filtering:
@@ -217,48 +271,73 @@ def get_optimizer(optim_comfig, lr, params, filtering=True):
             group_params.append({"params": other_params, "weight_decay": 0.0})
         group_params.append({"order_params": params})
         params = group_params
+        print(
+            f"Enable optimizer group param, "
+            f"decay params num: {len(decay_params)}, "
+            f"no decay params num: {len(other_params)}, "
+            f"full params num: {len(decay_params) + len(other_params)}"
+        )
 
     # build optimizer
     optimizer = get_obj_from_str(optimizer_config["target"])(
         params, learning_rate=lr, **optimizer_config.get("params", dict())
     )
+
     return optimizer
 
 
 def load_model_from_config(model_config, ckpts=None, verbose=True, amp_level="O0"):
     model = instantiate_from_config(model_config)
 
+    from gm.models.diffusion import DiffusionEngineMultiGraph
+
     if ckpts:
-        print(f"Loading model from {ckpts}")
-        if isinstance(ckpts, str):
-            ckpts = [ckpts]
+        logging.info(f"Loading model from {ckpts}")
+        if not isinstance(model, DiffusionEngineMultiGraph):
+            if isinstance(ckpts, str):
+                ckpts = [ckpts]
 
-        sd_dict = {}
-        for ckpt in ckpts:
-            assert ckpt.endswith(".ckpt")
-            _sd_dict = ms.load_checkpoint(ckpt)
-            sd_dict.update(_sd_dict)
+            sd_dict = {}
+            for ckpt in ckpts:
+                assert ckpt.endswith(".ckpt")
+                _sd_dict = ms.load_checkpoint(ckpt)
+                sd_dict.update(_sd_dict)
 
-            if "global_step" in sd_dict:
-                global_step = sd_dict["global_step"]
-                print(f"loaded ckpt from global step {global_step}")
-                print(f"Global Step: {sd_dict['global_step']}")
+                if "global_step" in sd_dict:
+                    global_step = sd_dict["global_step"]
+                    print(f"loaded ckpt from global step {global_step}")
+                    print(f"Global Step: {sd_dict['global_step']}")
 
-        m, u = ms.load_param_into_net(model, sd_dict, strict_load=False)
+            # FIXME: parameter auto-prefix name bug on mindspore 2.2.10
+            _new_sd_dict = {}
+            for k in sd_dict:
+                if "._backbone" in k:
+                    _index = k.find("._backbone")
+                    new_k = k[:_index] + k[_index + len("._backbone") :]
+                else:
+                    new_k = k[:]
+                _new_sd_dict[new_k] = sd_dict[k]
+            sd_dict = _new_sd_dict
 
-        if len(m) > 0 and verbose:
-            ignore_lora_key = len(ckpts) == 1
-            m = m if not ignore_lora_key else [k for k in m if "lora_" not in k]
-            print("missing keys:")
-            print(m)
-        if len(u) > 0 and verbose:
-            print("unexpected keys:")
-            print(u)
+            m, u = ms.load_param_into_net(model, sd_dict, strict_load=False)
+
+            if len(m) > 0 and verbose:
+                ignore_lora_key = len(ckpts) == 1
+                m = m if not ignore_lora_key else [k for k in m if "lora_" not in k]
+                print("missing keys:")
+                print(m)
+            if len(u) > 0 and verbose:
+                print("unexpected keys:")
+                print(u)
+        else:
+            model.load_pretrained(ckpts, verbose=verbose)
     else:
-        print(f"Warning: Loading model from {ckpts}")
+        logging.warning("No checkpoints were provided.")
 
-    model = auto_mixed_precision(model, amp_level=amp_level)
-    model.set_train(False)
+    if not isinstance(model, DiffusionEngineMultiGraph):
+        model = auto_mixed_precision(model, amp_level=amp_level)
+        model.set_train(False)
+
     return model
 
 
@@ -276,6 +355,9 @@ def get_batch(keys, value_dict, N: Union[List, ListConfig], dtype=ms.float32):
         if key == "txt":
             batch["txt"] = np.repeat([value_dict["prompt"]], repeats=np.prod(N)).reshape(N).tolist()
             batch_uc["txt"] = np.repeat([value_dict["negative_prompt"]], repeats=np.prod(N)).reshape(N).tolist()
+        elif key == "clip_img":
+            batch["clip_img"] = value_dict["clip_img"]
+            batch_uc["clip_img"] = None
         elif key == "original_size_as_tuple":
             batch["original_size_as_tuple"] = Tensor(
                 np.tile(
@@ -353,6 +435,10 @@ def get_discretization(discretization, sigma_min=0.03, sigma_max=14.61, rho=3.0)
                 "rho": rho,
             },
         }
+    elif discretization == "DiffusersDDPMDiscretization":
+        discretization_config = {
+            "target": "gm.modules.diffusionmodules.discretizer.DiffusersDDPMDiscretization",
+        }
     else:
         raise NotImplementedError
 
@@ -415,14 +501,14 @@ def get_sampler(
             )
         else:
             raise ValueError
-    elif sampler_name in ("AncestralSampler"):
+    elif sampler_name == "AncestralSampler":
         sampler = AncestralSampler(
             num_steps=steps,
             discretization_config=discretization_config,
             guider_config=guider_config,
             verbose=True,
         )
-    elif sampler_name in ("EulerAncestralSampler"):
+    elif sampler_name == "EulerAncestralSampler":
         sampler = EulerAncestralSampler(
             num_steps=steps,
             discretization_config=discretization_config,
@@ -430,7 +516,7 @@ def get_sampler(
             verbose=True,
             eta=0.001,
         )
-    elif sampler_name in ("DPMPP2SAncestralSampler"):
+    elif sampler_name == "DPMPP2SAncestralSampler":
         sampler = DPMPP2SAncestralSampler(
             num_steps=steps,
             discretization_config=discretization_config,
@@ -438,15 +524,22 @@ def get_sampler(
             verbose=True,
         )
 
-    elif sampler_name in ("DPMPP2MSampler",):
+    elif sampler_name == "DPMPP2MSampler":
         sampler = DPMPP2MSampler(
             num_steps=steps,
             discretization_config=discretization_config,
             guider_config=guider_config,
             verbose=True,
         )
-    elif sampler_name in ("LinearMultistepSampler",):
+    elif sampler_name == "LinearMultistepSampler":
         sampler = LinearMultistepSampler(
+            num_steps=steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            verbose=True,
+        )
+    elif sampler_name == "LCMSampler":
+        sampler = LCMSampler(
             num_steps=steps,
             discretization_config=discretization_config,
             guider_config=guider_config,
@@ -477,11 +570,13 @@ def init_sampling(
         "DPMPP2MSampler",
         "LinearMultistepSampler",
         "AncestralSampler",
+        "LCMSampler",
     ]
     assert guider in ["VanillaCFG", "IdentityGuider"]
     assert discretization in [
         "LegacyDDPMDiscretization",
         "EDMDiscretization",
+        "DiffusersDDPMDiscretization",
     ]
 
     steps = min(max(steps, 1), 1000)
@@ -514,10 +609,9 @@ def _get_broadcast_datetime(rank_size=1, root_rank=0):
     if rank_size <= 1:
         return time_list
 
-    bd_cast = ops.Broadcast(root_rank=root_rank)
     # only broadcast in distribution mode
-    x = bd_cast((Tensor(time_list, dtype=ms.int32),))
-    x = x[0].asnumpy().tolist()
+    bd_cast = BroadCast(root_rank=root_rank)(Tensor(time_list, dtype=ms.int32))
+    x = bd_cast.asnumpy().tolist()
 
     return x
 

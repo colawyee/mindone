@@ -67,35 +67,36 @@ class DDIMSampler(object):
         self.ddim_sigmas_for_original_num_steps = sigmas_for_original_sampling_steps
 
     def sample(
-            self,
-            S,
-            batch_size,
-            shape,
-            conditioning=None,
-            callback=None,
-            normals_sequence=None,
-            img_callback=None,
-            quantize_x0=False,
-            eta=0.0,
-            mask=None,
-            x0=None,
-            temperature=1.0,
-            noise_dropout=0.0,
-            score_corrector=None,
-            corrector_kwargs=None,
-            verbose=True,
-            x_T=None,
-            log_every_t=100,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            features_adapter=None,
-            append_to_context=None,
-            cond_tau=0.4,
-            style_cond_tau=1.0,
-            # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
-            dynamic_threshold=None,
-            ucg_schedule=None,
-            **kwargs,
+        self,
+        S,
+        batch_size,
+        shape,
+        conditioning=None,
+        callback=None,
+        normals_sequence=None,
+        img_callback=None,
+        quantize_x0=False,
+        eta=0.0,
+        mask=None,
+        x0=None,
+        temperature=1.0,
+        noise_dropout=0.0,
+        score_corrector=None,
+        corrector_kwargs=None,
+        verbose=True,
+        x_T=None,
+        log_every_t=100,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        features_adapter=None,
+        append_to_context=None,
+        cond_tau=0.4,
+        style_cond_tau=1.0,
+        # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
+        dynamic_threshold=None,
+        ucg_schedule=None,
+        timesteps=None,
+        **kwargs,
     ):
         if conditioning is not None:
             if isinstance(conditioning, dict):
@@ -143,34 +144,35 @@ class DDIMSampler(object):
             style_cond_tau=style_cond_tau,
             dynamic_threshold=dynamic_threshold,
             ucg_schedule=ucg_schedule,
+            timesteps=timesteps,
         )
         return samples, intermediates
 
     def ddim_sampling(
-            self,
-            cond,
-            shape,
-            x_T=None,
-            ddim_use_original_steps=False,
-            callback=None,
-            timesteps=None,
-            quantize_denoised=False,
-            mask=None,
-            x0=None,
-            img_callback=None,
-            log_every_t=100,
-            temperature=1.0,
-            noise_dropout=0.0,
-            score_corrector=None,
-            corrector_kwargs=None,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            features_adapter=None,
-            append_to_context=None,
-            cond_tau=0.4,
-            style_cond_tau=1.0,
-            dynamic_threshold=None,
-            ucg_schedule=None,
+        self,
+        cond,
+        shape,
+        x_T=None,
+        ddim_use_original_steps=False,
+        callback=None,
+        timesteps=None,
+        quantize_denoised=False,
+        mask=None,
+        x0=None,
+        img_callback=None,
+        log_every_t=100,
+        temperature=1.0,
+        noise_dropout=0.0,
+        score_corrector=None,
+        corrector_kwargs=None,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        features_adapter=None,
+        append_to_context=None,
+        cond_tau=0.4,
+        style_cond_tau=1.0,
+        dynamic_threshold=None,
+        ucg_schedule=None,
     ):
         b = shape[0]
         if x_T is None:
@@ -184,14 +186,14 @@ class DDIMSampler(object):
             subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
             timesteps = self.ddim_timesteps[:subset_end]
 
-        intermediates = {"x_inter": [], "pred_x0": []}
+        intermediates = {"x_inter": [img], "pred_x0": [img]}
         time_range = reversed(range(0, timesteps)) if ddim_use_original_steps else ms.numpy.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
         iterator = time_range
 
-        for i, step in enumerate(iterator):
+        for i, step in tqdm(enumerate(iterator), total=len(iterator)):
             index = total_steps - i - 1
             ts = ms.numpy.full((b,), step, dtype=ms.int64)
 
@@ -228,30 +230,29 @@ class DDIMSampler(object):
                 img_callback(pred_x0, i)
 
             if index % log_every_t == 0 or index == total_steps - 1:
-                pass
-                # intermediates["x_inter"].append(img)
-                # intermediates["pred_x0"].append(pred_x0)
+                intermediates["x_inter"].append(img)
+                intermediates["pred_x0"].append(pred_x0)
 
         return img, intermediates
 
     def p_sample_ddim(
-            self,
-            x,
-            c,
-            t,
-            index,
-            repeat_noise=False,
-            use_original_steps=False,
-            quantize_denoised=False,
-            temperature=1.0,
-            noise_dropout=0.0,
-            score_corrector=None,
-            corrector_kwargs=None,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            dynamic_threshold=None,
-            features_adapter=None,
-            append_to_context=None,
+        self,
+        x,
+        c,
+        t,
+        index,
+        repeat_noise=False,
+        use_original_steps=False,
+        quantize_denoised=False,
+        temperature=1.0,
+        noise_dropout=0.0,
+        score_corrector=None,
+        corrector_kwargs=None,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        dynamic_threshold=None,
+        features_adapter=None,
+        append_to_context=None,
     ):
         b = x.shape[0]
 
@@ -307,11 +308,10 @@ class DDIMSampler(object):
         )
         sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
         # select parameters corresponding to the currently considered timestep
-        shape = (1,) * (len(e_t.shape) - 1)
-        a_t = ms.numpy.full((b,) + shape, alphas[index])
-        a_prev = ms.numpy.full((b,) + shape, alphas_prev[index])
-        sigma_t = ms.numpy.full((b,) + shape, sigmas[index])
-        sqrt_one_minus_at = ms.numpy.full((b,) + shape, sqrt_one_minus_alphas[index])
+        a_t = ms.numpy.full((b, 1, 1, 1), alphas[index])
+        a_prev = ms.numpy.full((b, 1, 1, 1), alphas_prev[index])
+        sigma_t = ms.numpy.full((b, 1, 1, 1), sigmas[index])
+        sqrt_one_minus_at = ms.numpy.full((b, 1, 1, 1), sqrt_one_minus_alphas[index])
 
         # current prediction for x_0
         if self.model.parameterization != "v":
@@ -326,24 +326,24 @@ class DDIMSampler(object):
             raise NotImplementedError()
 
         # direction pointing to x_t
-        dir_xt = (1.0 - a_prev - sigma_t ** 2).sqrt() * e_t
+        dir_xt = (1.0 - a_prev - sigma_t**2).sqrt() * e_t
         noise = sigma_t * noise_like(x.shape, repeat_noise) * temperature
         if noise_dropout > 0.0:
             noise, _ = ops.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
 
-        return x_prev, None
+        return x_prev, pred_x0
 
     def encode(
-            self,
-            x0,
-            c,
-            t_enc,
-            use_original_steps=False,
-            return_intermediates=None,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            callback=None,
+        self,
+        x0,
+        c,
+        t_enc,
+        use_original_steps=False,
+        return_intermediates=None,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        callback=None,
     ):
         num_reference_steps = self.ddpm_num_timesteps if use_original_steps else self.ddim_timesteps.shape[0]
 
@@ -376,7 +376,7 @@ class DDIMSampler(object):
 
             xt_weighted = (alphas_next[i] / alphas[i]).sqrt() * x_next
             weighted_noise_pred = (
-                    alphas_next[i].sqrt() * ((1 / alphas_next[i] - 1).sqrt() - (1 / alphas[i] - 1).sqrt()) * noise_pred
+                alphas_next[i].sqrt() * ((1 / alphas_next[i] - 1).sqrt() - (1 / alphas[i] - 1).sqrt()) * noise_pred
             )
             x_next = xt_weighted + weighted_noise_pred
             if return_intermediates and i % (num_steps // return_intermediates) == 0 and i < num_steps - 1:
@@ -406,19 +406,19 @@ class DDIMSampler(object):
         if noise is None:
             noise = ms.numpy.randn(x0.shape)
         return (
-                extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0
-                + extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
+            extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0
+            + extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
         )
 
     def decode(
-            self,
-            x_latent,
-            cond,
-            t_start,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            use_original_steps=False,
-            callback=None,
+        self,
+        x_latent,
+        cond,
+        t_start,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        use_original_steps=False,
+        callback=None,
     ):
         timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
         timesteps = timesteps[:t_start]
