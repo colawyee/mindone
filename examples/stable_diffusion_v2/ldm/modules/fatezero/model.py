@@ -69,7 +69,7 @@ class CrossAttention(BaseCrossAttention):
             print('attention:', q.shape, k.shape)
 
             print(self.cur_step.asnumpy(), self.layer_name, self.layer_num)
-            key = F"attn-step_{self.cur_step}_{self.layer_name}-{'cross' if is_cross else 'self'}_{self.layer_num}"
+            key = F"attn-step_{self.cur_step.asnumpy()}_{self.layer_name}-{'cross' if is_cross else 'self'}_{self.layer_num}"
             print(key)
             out = self.attention(q, k, v, mask)
             # ms.save_checkpoint([{"name": "data", "data": out}], F"./output/{key}.ckpt")
