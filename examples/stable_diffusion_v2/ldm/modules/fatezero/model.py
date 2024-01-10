@@ -1,12 +1,8 @@
-# - controller注册
-# - forward替换
-# - 加噪声过程中保存attention
-# - 替换
 import logging
 
 import numpy as np
 from ldm.modules.attention import FeedForward, default
-from ldm.modules.attention import Attention, CrossAttention
+from ldm.modules.attention import CrossAttention as BaseCrossAttention
 from ldm.modules.diffusionmodules.util import Identity, linear, timestep_embedding
 from ldm.util import is_old_ms_version
 
@@ -17,14 +13,10 @@ from examples.stable_diffusion_v2.ldm.models.diffusion.ddpm import LatentDiffusi
 from examples.stable_diffusion_v2.ldm.modules.attention import exists
 
 _logger = logging.getLogger(__name__)
-try:
-    from mindspore.ops._op_impl._custom_op.flash_attention.flash_attention_impl import get_flash_attention
 
-    FLASH_IS_AVAILABLE = True
-    print("flash attention is available.")
-except ImportError:
-    FLASH_IS_AVAILABLE = False
-    print("flash attention is unavailable.")
+
+def is_true(tensor):
+    return bool(tensor == 1)
 
 
 class GroupNorm(nn.GroupNorm):
@@ -49,6 +41,52 @@ def normalization(channels, eps: float = 1e-5):
     return GroupNorm(32, channels, eps=eps).to_float(ms.float32)
 
 
+class CrossAttention(BaseCrossAttention):
+    def _attention(self, k, q, v, mask):
+
+        def rearange_in(x):
+            # (b, n, h*d) -> (b*h, n, d)
+            h = self.heads
+            b, n, d = x.shape
+            d = d // h
+
+            x = self.reshape(x, (b, n, h, d))
+            x = self.transpose(x, (0, 2, 1, 3))
+            x = self.reshape(x, (b * h, n, d))
+            return x
+
+        q = rearange_in(q)
+        k = rearange_in(k)
+        v = rearange_in(v)
+
+        if self.use_flash_attention and q.shape[1] % 16 == 0 and k.shape[1] % 16 == 0:
+            out = self.flash_attention(q, k, v)
+        else:
+            out = self.attention(q, k, v, mask)
+
+        def rearange_out(x):
+            # (b*h, n, d) -> (b, n, h*d)
+            h = self.heads
+            b, n, d = x.shape
+            b = b // h
+
+            x = self.reshape(x, (b, h, n, d))
+            x = self.transpose(x, (0, 2, 1, 3))
+            x = self.reshape(x, (b, n, h * d))
+            return x
+
+        out = rearange_out(out)
+        return self.to_out(out)
+
+    def construct(self, x, context=None, mask=None):
+
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+        return self._attention(k, q, v, mask)
+
+
 # Spatial Transformer and Attention Layer Modification based on SD
 class SparseCausalAttention(CrossAttention):
     """
@@ -67,59 +105,17 @@ class SparseCausalAttention(CrossAttention):
         return x
 
     def construct(self, x, context=None, mask=None, video_length=None):
-        is_cross = context is not None
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
-
-        def rearange_in(x):
-            # (b, n, h*d) -> (b*h, n, d)
-            h = self.heads
-            b, n, d = x.shape
-            d = d // h
-
-            x = self.reshape(x, (b, n, h, d))
-            x = self.transpose(x, (0, 2, 1, 3))
-            x = self.reshape(x, (b * h, n, d))
-            return x
 
         former_frame_index = ops.arange(video_length) - 1
         former_frame_index[0] = 0
 
         k = self.concat_first_previous_features(k, video_length, former_frame_index)
         v = self.concat_first_previous_features(v, video_length, former_frame_index)
-
-        q = rearange_in(q)
-        k = rearange_in(k)
-        v = rearange_in(v)
-
-        if mask is not None:
-            if mask.shape[-1] != q.shape[1]:
-                target_length = q.shape[1]
-                ndim = len(mask.shape)
-                paddings = [[0, 0] for i in range(ndim - 1)] + [0, target_length]
-                mask = nn.Pad(paddings)(mask)
-                mask = mask.repeat_interleave(self.heads, axis=0)
-
-        if self.use_flash_attention and q.shape[1] % 16 == 0 and k.shape[1] % 16 == 0:
-            out = self.flash_attention(q, k, v)
-        else:
-            out = self.attention(q, k, v, mask, is_cross_attention=is_cross)
-
-        def rearange_out(x):
-            # (b*h, n, d) -> (b, n, h*d)
-            h = self.heads
-            b, n, d = x.shape
-            b = b // h
-
-            x = self.reshape(x, (b, h, n, d))
-            x = self.transpose(x, (0, 2, 1, 3))
-            x = self.reshape(x, (b, n, h * d))
-            return x
-
-        out = rearange_out(out)
-        return self.to_out(out)
+        return self._attention(k, q, v, mask)
 
 
 class BasicTransformerBlock_ST(nn.Cell):
@@ -970,6 +966,8 @@ class UNetModel3D(nn.Cell):
                 mblock.recompute(parallel_optimizer_comm_recompute=True)
             for oblock in self.output_blocks:
                 oblock.recompute(parallel_optimizer_comm_recompute=True)
+        self.cur_step = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
+        self.is_invert = Parameter(ms.Tensor(0, dtype=ms.uint8), requires_grad=False)
 
     def construct(
             self, x, timesteps=None, context=None, y=None, features_adapter: list = None, append_to_context=None,
@@ -983,6 +981,11 @@ class UNetModel3D(nn.Cell):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
+        if is_true(self.is_invert):
+            print(True)
+        else:
+            print(False)
+        print(self.cur_step.value)
         assert (y is not None) == (
                 self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -1021,6 +1024,11 @@ class UNetModel3D(nn.Cell):
             for cell in celllist:
                 h = cell(h, emb, context)
             hs_index -= 1
+
+        if self.cur_step == 49:
+            self.cur_step = 0
+        else:
+            self.cur_step += 1
 
         if self.predict_codebook_ids:
             return self.id_predictor(h)

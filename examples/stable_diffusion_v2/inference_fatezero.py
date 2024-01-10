@@ -41,13 +41,15 @@ from examples.stable_diffusion_v2.ldm.modules.fatezero.p2p import AttentionStore
 workspace = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(workspace)
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
+from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.uni_pc import UniPCSampler
 from ldm.modules.logger import set_logger
 from ldm.modules.train.tools import set_random_seed
 from ldm.util import instantiate_from_config, str2bool
 from utils import model_utils
-from ldm.modules.fatezero.ddim import DDIMSampler
+
+# from ldm.modules.fatezero.ddim import DDIMSampler
 
 logger = logging.getLogger("text_to_image")
 
@@ -166,8 +168,10 @@ def parse_args():
         default="2.0",
         help="Stable diffusion version. Options: '2.1', '2.1-v', '2.0', '2.0-v', '1.5', '1.5-wukong'",
     )
-    parser.add_argument("--source_prompt", type=str, nargs="?", default="a silver jeep driving down a curvy road in the countryside", help="")
-    parser.add_argument("--target_prompt", type=str, nargs="?", default="a Porsche car driving down a curvy road in the countryside", help="")
+    parser.add_argument("--source_prompt", type=str, nargs="?",
+                        default="a silver jeep driving down a curvy road in the countryside", help="")
+    parser.add_argument("--target_prompt", type=str, nargs="?",
+                        default="a Porsche car driving down a curvy road in the countryside", help="")
     # todo negative_prompt
     # parser.add_argument("--negative_prompt", type=str, nargs="?", default="", help="the negative prompt not to render")
     parser.add_argument("--output_path", type=str, nargs="?", default="output/", help="dir to write results to")
@@ -388,26 +392,34 @@ def main(args):
     )
     key_info += "\n" + "=" * 50
     logger.info(key_info)
-
+    unet = model.model.diffusion_model
     # infer
     shape = [4, len(frames), args.H // 8, args.W // 8]
-    inv_sampler = DDIMSampler(model, controller=AttentionStore())
+    inv_sampler = DDIMSampler(model)
     inv_sampler.make_schedule(args.inv_sampling_steps, verbose=False)
-    if True or not os.path.exists(args.latent_path):
-        c = model.get_learned_conditioning(model.tokenize([source_prompt]))
-        frames = ms.Tensor(frames[None, ...])
-        latents, _ = model.get_input(frames, c)
-        ddim_inv, _ = inv_sampler.encode(latents, c, args.inv_sampling_steps)
-        start_code = ddim_inv
-        ms.save_checkpoint([{"name": "start_code", "data": start_code}], args.latent_path)
-    else:
-        p = ms.load_checkpoint(args.latent_path)
-        start_code = ms.Tensor(p["start_code"]).to(ms.float16)
+    c = model.get_learned_conditioning(model.tokenize([source_prompt]))
+    frames = ms.Tensor(frames[None, ...])
+    latents, _ = model.get_input(frames, c)
+    unet.is_invert.set_data(ms.Tensor(1, dtype=ms.uint8))
+    ddim_inv, _ = inv_sampler.encode(latents, c, args.inv_sampling_steps)
+    unet.is_invert.set_data(ms.Tensor(0, dtype=ms.uint8))
+    start_code = ddim_inv
+
+    # if True or not os.path.exists(args.latent_path):
+    #     c = model.get_learned_conditioning(model.tokenize([source_prompt]))
+    #     frames = ms.Tensor(frames[None, ...])
+    #     latents, _ = model.get_input(frames, c)
+    #     ddim_inv, _ = inv_sampler.encode(latents, c, args.inv_sampling_steps)
+    #     start_code = ddim_inv
+    #     ms.save_checkpoint([{"name": "start_code", "data": start_code}], args.latent_path)
+    # else:
+    #     p = ms.load_checkpoint(args.latent_path)
+    #     start_code = ms.Tensor(p["start_code"]).to(ms.float16)
     start_code = start_code.broadcast_to((batch_size, *shape))
 
     negative_prompts = [""] * batch_size
     prompts = [target_prompt]
-
+    model.is_invert = 0
     for n in range(args.n_iter):
         start_time = time.time()
         uc = None
@@ -417,10 +429,9 @@ def main(args):
         tokenized_prompts = model.tokenize(prompts)
         c = model.get_learned_conditioning(tokenized_prompts)
 
-        # local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep', ], ["car", ]])
-        local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep']])
-        controller = AttentionControlReplace(prompts=[source_prompt, target_prompt], local_blend=local_blend)
-        inv_sampler.pre_sample(model=model, controller=controller)
+        # local_blend = SpatialBlender(prompts=[source_prompt], words=[['jeep']])
+        # controller = AttentionControlReplace(prompts=[source_prompt, target_prompt], local_blend=local_blend)
+        # inv_sampler.pre_sample(model=model, controller=controller)
         samples_ddim, _ = inv_sampler.sample(
             S=args.sampling_steps,
             conditioning=c,
@@ -432,11 +443,6 @@ def main(args):
             eta=args.ddim_eta,
             x_T=start_code,
         )
-        print(gc.collect())
-        del inv_sampler
-        # del c, tokenized_prompts, uc, tokenized_negative_prompts, start_code, ddim_inv,frames,latents
-        # ms.ms_memory_recycle()
-        print(gc.collect())
 
         b, c, f, h, w = samples_ddim.shape
         samples_ddim = samples_ddim.transpose((0, 2, 1, 3, 4)).reshape((b * f, c, h, w))

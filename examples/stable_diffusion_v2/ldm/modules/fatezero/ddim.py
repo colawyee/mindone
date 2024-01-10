@@ -8,16 +8,13 @@ from ..diffusionmodules.util import noise_like
 
 
 class DDIMSampler(BaseDDIMSampler):
-    def __init__(self, model, schedule="linear", controller=None):
+    def __init__(self, model, schedule="linear"):
         super().__init__(model, schedule)
-        self.edit_controller = None
-        self.controller = controller
-        register_attention_control(model, controller)
+
 
     def pre_sample(self,model, controller=None):
         self.controller.is_invert = False
         self.edit_controller = controller
-        register_attention_control(model, controller)
 
         self.edit_controller.attention_store_all_step = self.controller.attention_store_all_step
         self.edit_controller.pos_dict = self.controller.pos_dict
@@ -42,7 +39,6 @@ class DDIMSampler(BaseDDIMSampler):
             append_to_context=None,
     ):
         b = x.shape[0]
-        print("index:", index)
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.0:
             c_in = c if append_to_context is None else ms.ops.cat([c, append_to_context], axis=1)
             model_output = self.model.apply_model(x, t, c_in, features_adapter=features_adapter)
